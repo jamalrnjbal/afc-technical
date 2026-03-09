@@ -15,6 +15,20 @@ TRAIN_END = pd.Timestamp('2025-09-30')
 FEATURES  = ['customer_enc', 'month_of_year', 'year', 'rolling_12m_rate']
 BLUE      = '#2980b9'
 
+# Friendly labels for risk segments shown to sales users
+RISK_LABELS = {
+    'high-freq/high-cost': 'High Risk',
+    'high-freq/low-cost':  'Watch List',
+    'low-freq/high-cost':  'Monitor',
+    'low-freq/low-cost':   'Low Risk',
+}
+RISK_COLORS = {
+    'High Risk':  '#e74c3c',
+    'Watch List': '#e67e22',
+    'Monitor':    '#f1c40f',
+    'Low Risk':   '#27ae60',
+}
+
 
 # ── Pipeline (runs once, cached) ──────────────────────────────────────────────
 
@@ -37,6 +51,10 @@ def run_pipeline():
     df['month']          = df['claim_date'].dt.month
     df['cost_delta']     = df['actual_cost_eur'] - df['estimated_cost_eur']
     df['cost_delta_pct'] = df['cost_delta'] / df['estimated_cost_eur']
+
+    # Translate German status values to English
+    status_map = {'storniert': 'cancelled', 'abgeschlossen': 'settled'}
+    df['status_en'] = df['status'].map(status_map).fillna(df['status'])
 
     active   = df[df['status'] != 'storniert'].copy()
     resolved = active[active['status'] == 'abgeschlossen'].copy()
@@ -145,13 +163,14 @@ def run_pipeline():
 
     med_c = annual['predicted_claims'].median()
     med_e = annual['predicted_cost_eur'].median()
-    annual['risk_segment'] = annual.apply(
+    annual['risk_segment_raw'] = annual.apply(
         lambda r: (
             ('high-freq' if r['predicted_claims']   >= med_c else 'low-freq') + '/' +
             ('high-cost' if r['predicted_cost_eur'] >= med_e else 'low-cost')
         ),
         axis=1,
     )
+    annual['risk_segment'] = annual['risk_segment_raw'].map(RISK_LABELS)
 
     return df, active, resolved, kpis, panel, fg, annual
 
@@ -163,27 +182,72 @@ st.set_page_config(page_title='AFC Claims Dashboard', layout='wide')
 df, active, resolved, kpis, panel, fg, annual = run_pipeline()
 
 st.sidebar.title('Filter')
-customer_options = ['All customers'] + sorted(df['customer_id'].unique().tolist())
-selected     = st.sidebar.selectbox('Customer', customer_options)
-is_filtered  = selected != 'All customers'
+customer_options = ['All clients'] + sorted(df['customer_id'].unique().tolist())
+selected     = st.sidebar.selectbox('Client', customer_options)
+is_filtered  = selected != 'All clients'
 
-tab1, tab2, tab3 = st.tabs(['Portfolio', 'Customer', 'Forecast'])
+st.sidebar.markdown('---')
+st.sidebar.markdown(
+    '**About this dashboard**\n\n'
+    'Shows claims history and a cost forecast for Apr–Dec 2026. '
+    'Select a client to see their individual profile and outlook.'
+)
+
+tab1, tab2, tab3 = st.tabs(['Business Health', 'Client Profile', '2026 Outlook'])
 
 
-# ── Tab 1: Portfolio ──────────────────────────────────────────────────────────
+# ── Tab 1: Business Health ────────────────────────────────────────────────────
 
 with tab1:
-    res_all = active[active['status'] == 'abgeschlossen']
+    res_all     = active[active['status'] == 'abgeschlossen']
     n_cancelled = (df['status'] == 'storniert').sum()
 
+    st.subheader('Portfolio at a Glance')
+    st.caption('Key numbers across all clients, based on claims submitted to date.')
+
     c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric('Customers',          df['customer_id'].nunique())
-    c2.metric('Active Claims',      f'{len(active):,}')
-    c3.metric('Avg Cost / Claim',   f'€{res_all["actual_cost_eur"].mean():,.0f}')
-    c4.metric('Avg Repair Duration',f'{res_all["repair_duration_days"].mean():.1f} days')
-    c5.metric('Cancellation Rate',  f'{n_cancelled / len(df):.1%}')
+    c1.metric(
+        'Total Clients', df['customer_id'].nunique(),
+        help='Number of unique clients with at least one claim on record.',
+    )
+    c2.metric(
+        'Open Claims', f'{len(active):,}',
+        help='Claims that are currently active (not cancelled).',
+    )
+    c3.metric(
+        'Average Claim Cost', f'€{res_all["actual_cost_eur"].mean():,.0f}',
+        help='Mean cost of fully settled claims across all clients.',
+    )
+    c4.metric(
+        'Average Repair Time', f'{res_all["repair_duration_days"].mean():.1f} days',
+        help='How long, on average, it takes to settle and close a claim.',
+    )
+    c5.metric(
+        'Cancelled Claims', f'{n_cancelled / len(df):.1%}',
+        help='Share of all submitted claims that were cancelled before settlement.',
+    )
 
     st.markdown('---')
+
+    # ── Clients needing attention ─────────────────────────────────────────────
+    attention = annual[annual['risk_segment'].isin(['High Risk', 'Watch List'])].reset_index()
+    if len(attention):
+        st.subheader(f'⚠ {len(attention)} Client(s) Needing Attention')
+        st.caption(
+            'These clients are forecast to generate the highest number of claims '
+            'and/or the highest costs in the rest of 2026. Consider proactive '
+            'outreach or pricing review before renewal.'
+        )
+        cols = st.columns(min(len(attention), 4))
+        for i, (_, row) in enumerate(attention.iterrows()):
+            color = RISK_COLORS.get(row['risk_segment'], BLUE)
+            cols[i % 4].markdown(
+                f"**{row['customer_id']}**  \n"
+                f"<span style='color:{color};font-weight:bold'>{row['risk_segment']}</span>  \n"
+                f"~{row['predicted_claims']:.0f} claims · €{row['predicted_cost_eur']:,.0f} forecast",
+                unsafe_allow_html=True,
+            )
+        st.markdown('---')
 
     col_l, col_r = st.columns(2)
 
@@ -200,17 +264,21 @@ with tab1:
         fig.add_trace(go.Scatter(
             x=monthly['month'], y=monthly['claims'],
             fill='tozeroy', fillcolor='rgba(41,128,185,0.12)',
-            line=dict(color=BLUE, width=1.5), name='Active claims',
+            line=dict(color=BLUE, width=1.5), name='Claims',
         ))
         fig.add_trace(go.Scatter(
             x=monthly['month'], y=monthly['rolling_avg'],
-            line=dict(color=BLUE, width=2.5, dash='dot'), name='3-month avg',
+            line=dict(color=BLUE, width=2.5, dash='dot'), name='3-month trend',
         ))
         fig.update_layout(
-            title='Monthly claim volume', height=300,
-            margin=dict(l=0, r=0, t=40, b=0), yaxis_title='Claims', xaxis_title=None,
+            title='Claims Per Month (all clients)',
+            height=300,
+            margin=dict(l=0, r=0, t=40, b=0),
+            yaxis_title='Number of Claims',
+            xaxis_title=None,
         )
         st.plotly_chart(fig, use_container_width=True)
+        st.caption('The dotted line shows the 3-month rolling average — useful for spotting trends.')
 
     with col_r:
         cat_order = (
@@ -220,22 +288,35 @@ with tab1:
         fig = px.box(
             active, y='damage_category', x='actual_cost_eur',
             category_orders={'damage_category': cat_order},
-            labels={'actual_cost_eur': 'Actual cost (EUR)', 'damage_category': ''},
-            title='Cost by damage category',
+            labels={
+                'actual_cost_eur':   'Settled Cost (EUR)',
+                'damage_category':   '',
+            },
+            title='Repair Cost by Damage Type',
         )
         fig.update_layout(height=300, margin=dict(l=0, r=0, t=40, b=0))
         st.plotly_chart(fig, use_container_width=True)
+        st.caption('Each bar shows the typical cost range for that damage type. The centre line is the median.')
 
-    # Customer risk scatter
+    # ── Customer risk scatter ─────────────────────────────────────────────────
+    st.subheader('Client Risk Overview')
+    st.caption(
+        'Each bubble is a client. Position shows how often they claim (left–right) '
+        'and how expensive those claims are (up–down). Bigger bubble = higher total cost. '
+        'Colour shows their risk category.'
+    )
+
     total_cost_map = active.groupby('customer_id')['actual_cost_eur'].sum()
     cust_plot = kpis.reset_index()
-    cust_plot['total_cost']    = cust_plot['customer_id'].map(total_cost_map)
-    cust_plot['risk_segment']  = cust_plot['customer_id'].map(annual['risk_segment'])
+    cust_plot['total_cost']   = cust_plot['customer_id'].map(total_cost_map)
+    cust_plot['risk_segment'] = cust_plot['customer_id'].map(annual['risk_segment'])
 
     fig = px.scatter(
         cust_plot,
         x='claim_frequency_rate', y='avg_cost_per_claim',
-        size='total_cost', color='risk_segment', hover_name='customer_id',
+        size='total_cost', color='risk_segment',
+        color_discrete_map=RISK_COLORS,
+        hover_name='customer_id',
         hover_data={
             'claim_frequency_rate': ':.1f',
             'avg_cost_per_claim':   ':,.0f',
@@ -243,44 +324,70 @@ with tab1:
             'total_cost':           ':,.0f',
         },
         labels={
-            'claim_frequency_rate': 'Claim frequency (per year)',
-            'avg_cost_per_claim':   'Avg cost per claim (EUR)',
+            'claim_frequency_rate': 'Claims Per Year',
+            'avg_cost_per_claim':   'Average Cost Per Claim (EUR)',
+            'risk_segment':         'Risk Level',
+            'total_cost':           'Total Cost (EUR)',
+            'avg_repair_duration':  'Avg Repair Days',
         },
-        title='Customer risk — bubble size = total cost exposure',
+        title='Client Risk Map — bubble size = total cost to date',
+        category_orders={'risk_segment': ['High Risk', 'Watch List', 'Monitor', 'Low Risk']},
     )
     fig.update_layout(height=420, margin=dict(l=0, r=0, t=40, b=0))
     st.plotly_chart(fig, use_container_width=True)
 
 
-# ── Tab 2: Customer ───────────────────────────────────────────────────────────
+# ── Tab 2: Client Profile ─────────────────────────────────────────────────────
 
 with tab2:
     if not is_filtered:
-        st.info('Select a customer from the sidebar to view their profile.')
+        st.info('Select a client from the sidebar to view their individual profile.')
     else:
         cust_active = active[active['customer_id'] == selected]
+
+        st.subheader(f'Client: {selected}')
 
         if selected in kpis.index:
             ck       = kpis.loc[selected]
             port_med = kpis.median()
 
+            st.caption(
+                'KPIs for this client compared to the portfolio median. '
+                'Arrows show whether this client is above or below average.'
+            )
+
             c1, c2, c3, c4, c5 = st.columns(5)
             c1.metric(
-                'Claim Frequency',
-                f'{ck["claim_frequency_rate"]:.1f} /yr',
-                delta=f'{ck["claim_frequency_rate"] - port_med["claim_frequency_rate"]:+.1f} vs median',
+                'Claims Per Year',
+                f'{ck["claim_frequency_rate"]:.1f}',
+                delta=f'{ck["claim_frequency_rate"] - port_med["claim_frequency_rate"]:+.1f} vs avg',
+                help='How many claims this client submits per year on average.',
             )
             c2.metric(
-                'Avg Cost / Claim',
+                'Average Claim Cost',
                 f'€{ck["avg_cost_per_claim"]:,.0f}',
-                delta=f'€{ck["avg_cost_per_claim"] - port_med["avg_cost_per_claim"]:+,.0f} vs median',
+                delta=f'€{ck["avg_cost_per_claim"] - port_med["avg_cost_per_claim"]:+,.0f} vs avg',
+                help='Average cost of a settled claim for this client.',
             )
-            c3.metric('Estimation Accuracy', f'{ck["estimation_accuracy"]:+.1%}')
-            c4.metric('Cancellation Rate',   f'{ck["cancellation_rate"]:.1%}')
+            c3.metric(
+                'Quote Accuracy',
+                f'{ck["estimation_accuracy"]:+.1%}',
+                help=(
+                    'How close our initial cost estimate was to the final settled amount. '
+                    'A positive number means final costs ran over the estimate; '
+                    'negative means we over-estimated.'
+                ),
+            )
+            c4.metric(
+                'Cancelled Claims',
+                f'{ck["cancellation_rate"]:.1%}',
+                help='Share of this client\'s claims that were cancelled before settlement.',
+            )
             c5.metric(
-                'Avg Repair Duration',
+                'Average Repair Time',
                 f'{ck["avg_repair_duration"]:.1f} days',
-                delta=f'{ck["avg_repair_duration"] - port_med["avg_repair_duration"]:+.1f}d vs median',
+                delta=f'{ck["avg_repair_duration"] - port_med["avg_repair_duration"]:+.1f}d vs avg',
+                help='Average number of days from claim submission to settlement.',
             )
 
         st.markdown('---')
@@ -292,10 +399,12 @@ with tab2:
             fault_counts.columns = ['fault_type', 'count']
             fig = px.pie(
                 fault_counts, names='fault_type', values='count',
-                hole=0.45, title='Fault type breakdown',
+                hole=0.45,
+                title='What Is Causing This Client\'s Claims?',
             )
             fig.update_layout(height=350, margin=dict(l=0, r=0, t=40, b=0))
             st.plotly_chart(fig, use_container_width=True)
+            st.caption('Breakdown of claim causes — useful for identifying patterns or coaching opportunities.')
 
         with col_r:
             cust_monthly = (
@@ -307,18 +416,26 @@ with tab2:
             cust_monthly.columns = ['month', 'total_cost']
             fig = px.bar(
                 cust_monthly, x='month', y='total_cost',
-                labels={'month': '', 'total_cost': 'Total resolved cost (EUR)'},
-                title='Monthly resolved cost',
+                labels={'month': '', 'total_cost': 'Total Settled Cost (EUR)'},
+                title='Monthly Settled Claim Cost',
             )
             fig.update_traces(marker_color=BLUE)
             fig.update_layout(height=350, margin=dict(l=0, r=0, t=40, b=0))
             st.plotly_chart(fig, use_container_width=True)
+            st.caption('Total cost of claims fully settled each month. Spikes may indicate seasonal patterns or incidents.')
 
 
-# ── Tab 3: Forecast ───────────────────────────────────────────────────────────
+# ── Tab 3: 2026 Outlook ───────────────────────────────────────────────────────
 
 with tab3:
     if not is_filtered:
+        st.subheader('Forecast: Apr – Dec 2026')
+        st.caption(
+            'This forecast uses historical claim patterns to predict how many claims each client '
+            'is likely to submit over the rest of 2026, and what those claims are likely to cost. '
+            'Use this to prioritise renewals, set reserves, or flag accounts for review.'
+        )
+
         annual_plot = annual.reset_index().sort_values('predicted_cost_eur', ascending=True)
 
         col_l, col_r = st.columns(2)
@@ -327,9 +444,17 @@ with tab3:
             fig = px.bar(
                 annual_plot, y='customer_id', x='predicted_claims',
                 orientation='h', color='risk_segment',
-                labels={'predicted_claims': 'Predicted claims (Apr–Dec 2026)', 'customer_id': ''},
-                title='Predicted claim volume — all customers',
-                category_orders={'customer_id': annual_plot['customer_id'].tolist()},
+                color_discrete_map=RISK_COLORS,
+                labels={
+                    'predicted_claims': 'Expected Claims (Apr–Dec 2026)',
+                    'customer_id':      '',
+                    'risk_segment':     'Risk Level',
+                },
+                title='Expected Number of Claims per Client',
+                category_orders={
+                    'customer_id':  annual_plot['customer_id'].tolist(),
+                    'risk_segment': ['High Risk', 'Watch List', 'Monitor', 'Low Risk'],
+                },
             )
             fig.update_layout(height=550, margin=dict(l=0, r=0, t=40, b=0))
             st.plotly_chart(fig, use_container_width=True)
@@ -338,27 +463,57 @@ with tab3:
             fig = px.bar(
                 annual_plot, y='customer_id', x='predicted_cost_eur',
                 orientation='h', color='risk_segment',
-                labels={'predicted_cost_eur': 'Predicted cost (EUR, Apr–Dec 2026)', 'customer_id': ''},
-                title='Predicted cost exposure — all customers',
-                category_orders={'customer_id': annual_plot['customer_id'].tolist()},
+                color_discrete_map=RISK_COLORS,
+                labels={
+                    'predicted_cost_eur': 'Expected Cost (EUR, Apr–Dec 2026)',
+                    'customer_id':        '',
+                    'risk_segment':       'Risk Level',
+                },
+                title='Expected Cost Exposure per Client',
+                category_orders={
+                    'customer_id':  annual_plot['customer_id'].tolist(),
+                    'risk_segment': ['High Risk', 'Watch List', 'Monitor', 'Low Risk'],
+                },
             )
             fig.update_layout(height=550, margin=dict(l=0, r=0, t=40, b=0), showlegend=False)
             st.plotly_chart(fig, use_container_width=True)
 
         st.markdown('---')
-        st.dataframe(
+        st.subheader('Full Forecast Table')
+        st.caption(
+            '"Likely Range" shows the lower and upper bound of expected claims — '
+            'there is an 80% chance the actual figure will fall within this range.'
+        )
+
+        display_df = (
             annual.reset_index()
             .sort_values('predicted_cost_eur', ascending=False)
-            .style.format({
-                'predicted_claims'  : '{:.0f}',
-                'predicted_cost_eur': '€{:,.0f}',
-                'ci_low'            : '{:.0f}',
-                'ci_high'           : '{:.0f}',
+            .rename(columns={
+                'customer_id':        'Client',
+                'predicted_claims':   'Expected Claims',
+                'predicted_cost_eur': 'Expected Cost (EUR)',
+                'ci_low':             'Low Estimate (Claims)',
+                'ci_high':            'High Estimate (Claims)',
+                'risk_segment':       'Risk Level',
+            })
+        )
+        st.dataframe(
+            display_df.style.format({
+                'Expected Claims':      '{:.0f}',
+                'Expected Cost (EUR)':  '€{:,.0f}',
+                'Low Estimate (Claims)': '{:.0f}',
+                'High Estimate (Claims)': '{:.0f}',
             }),
             use_container_width=True,
         )
 
     else:
+        st.subheader(f'2026 Outlook: {selected}')
+        st.caption(
+            'Grey bars show actual claims from the past. Blue bars show what we expect '
+            'for the rest of 2026, with error bars indicating the likely range.'
+        )
+
         cust_hist = panel[panel['customer_id'] == selected][['month', 'claim_count']].copy()
         cust_fc   = fg[fg['customer_id'] == selected][
             ['month', 'predicted_claims', 'ci_low', 'ci_high']
@@ -367,11 +522,11 @@ with tab3:
         fig = go.Figure()
         fig.add_trace(go.Bar(
             x=cust_hist['month'], y=cust_hist['claim_count'],
-            name='Historical', marker_color='#bdc3c7',
+            name='Historical claims', marker_color='#bdc3c7',
         ))
         fig.add_trace(go.Bar(
             x=cust_fc['month'], y=cust_fc['predicted_claims'],
-            name='Forecast (80% CI)', marker_color=BLUE,
+            name='Forecast (with likely range)', marker_color=BLUE,
             error_y=dict(
                 type='data', symmetric=False,
                 array=(cust_fc['ci_high'] - cust_fc['predicted_claims']).values,
@@ -385,16 +540,37 @@ with tab3:
             annotation_text='Today', annotation_position='top right',
         )
         fig.update_layout(
-            title=f'{selected} — historical claims + 2026 forecast',
+            title=f'{selected} — Past Claims & 2026 Forecast',
             height=440, margin=dict(l=0, r=0, t=50, b=0),
-            yaxis_title='Claims', xaxis_title=None,
+            yaxis_title='Number of Claims', xaxis_title=None,
         )
         st.plotly_chart(fig, use_container_width=True)
 
         if selected in annual.index:
             row = annual.loc[selected]
             c1, c2, c3, c4 = st.columns(4)
-            c1.metric('Predicted Claims (Apr–Dec)', f'{row["predicted_claims"]:.0f}')
-            c2.metric('Predicted Cost',              f'€{row["predicted_cost_eur"]:,.0f}')
-            c3.metric('80% CI',                      f'{row["ci_low"]:.0f} – {row["ci_high"]:.0f}')
-            c4.metric('Risk Segment',                row['risk_segment'])
+            c1.metric(
+                'Expected Claims (Apr–Dec)',
+                f'{row["predicted_claims"]:.0f}',
+                help='Total number of claims we expect this client to submit over the rest of 2026.',
+            )
+            c2.metric(
+                'Expected Cost',
+                f'€{row["predicted_cost_eur"]:,.0f}',
+                help='Forecast total cost of those claims based on this client\'s historical average.',
+            )
+            c3.metric(
+                'Likely Range',
+                f'{row["ci_low"]:.0f} – {row["ci_high"]:.0f} claims',
+                help='There is an 80% chance the actual claim count will fall within this range.',
+            )
+            c4.metric(
+                'Risk Level',
+                row['risk_segment'],
+                help=(
+                    'High Risk: high claim frequency AND high cost. '
+                    'Watch List: high frequency, lower cost. '
+                    'Monitor: lower frequency, higher cost. '
+                    'Low Risk: low frequency and low cost.'
+                ),
+            )
