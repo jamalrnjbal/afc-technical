@@ -94,9 +94,9 @@ def build_forecast(active):
     last_rate = panel.groupby("customer_id")["rolling_12m_rate"].last()
     fc_grid["rolling_12m_rate"] = fc_grid["customer_id"].map(last_rate)
     mu = result.predict(make_X(fc_grid)).values
-    fc_grid["predicted_claims"] = mu
-    fc_grid["ci_low"]  = stats.poisson.ppf(0.10, np.maximum(mu, 0.01)).clip(min=0)
-    fc_grid["ci_high"] = stats.poisson.ppf(0.90, np.maximum(mu, 0.01))
+    fc_grid["predicted_claims"] = np.round(mu).astype(int)
+    fc_grid["ci_low"]  = stats.poisson.ppf(0.10, np.maximum(mu, 0.01)).clip(min=0).astype(int)
+    fc_grid["ci_high"] = stats.poisson.ppf(0.90, np.maximum(mu, 0.01)).astype(int)
     global_avg  = active["actual_cost_eur"].mean()
     cust_stats  = active.groupby("customer_id").agg(n=("actual_cost_eur","count"), avg=("actual_cost_eur","mean"))
     k = 5
@@ -128,7 +128,7 @@ cust_pan = panel[panel["customer_id"] == selected].copy()
 BLUE = "#2563eb"; RED = "#dc2626"; GREY = "#cbd5e1"; ORANGE = "#f97316"
 CL = dict(plot_bgcolor="white", paper_bgcolor="white",
           margin=dict(l=0, r=10, t=40, b=0),
-          font=dict(family="Inter", size=11, color="#64748b"),
+          font=dict(family="Inter", size=11, color="#1e293b"),
           title_font=dict(size=13, color="#1a2332"),
           hovermode="x unified",
           legend=dict(orientation="h", y=-0.22, font=dict(size=10)))
@@ -322,8 +322,8 @@ if len(hist_recent) > 0:
         opacity=0.35, showlegend=False, hoverinfo="skip"))
 fig.add_trace(go.Scatter(x=cust_fc["month"], y=cust_fc["predicted_claims"],
     line=dict(color=BLUE, width=2, dash="dash"), mode="lines+markers", marker=dict(size=4),
-    name=f"Prognose · {fc_total:.0f} Schäden erwartet",
-    hovertemplate="%{y:.1f} Schäden<extra>Prognose</extra>"))
+    name=f"Prognose · {int(fc_total)} Schäden erwartet",
+    hovertemplate="%{y:.0f} Schäden<extra>Prognose</extra>"))
 fig.add_vline(x="2025-10-01", line_color="#e2e8f0", line_width=1.5, line_dash="dot")
 fig.add_vline(x="2026-04-01", line_color="#94a3b8", line_width=1.5, line_dash="dot")
 fig.add_annotation(x="2025-10-15", y=0, yref="paper", yanchor="bottom",
@@ -331,7 +331,7 @@ fig.add_annotation(x="2025-10-15", y=0, yref="paper", yanchor="bottom",
 fig.add_annotation(x="2026-04-15", y=0, yref="paper", yanchor="bottom",
     text="Prognose →", showarrow=False, font=dict(size=10, color="#64748b"))
 fig.update_layout(**CL,
-    title=f"Schadenshäufigkeit & Prognose · 80% KI: {fc_lo:.0f}–{fc_hi:.0f} Schäden (Apr–Dez 2026)",
+    title=f"Schadenshäufigkeit & Prognose · 80% KI: {int(fc_lo)}–{int(fc_hi)} Schäden (Apr–Dez 2026)",
     height=340,
     yaxis=dict(title="Schäden / Monat", gridcolor="#f1f5f9"),
     xaxis=dict(gridcolor="#f1f5f9"))
