@@ -37,7 +37,9 @@ section[data-testid="stSidebar"] .stSelectbox label {
 
 @st.cache_data
 def load_data():
-    df = pd.read_csv("claims_data.csv", parse_dates=["claim_date"])
+    import os as _os
+    _here = _os.path.dirname(_os.path.abspath(__file__))
+    df = pd.read_csv(_os.path.join(_here, "claims_data.csv"), parse_dates=["claim_date"])
     gmc = df.groupby(["damage_category","vehicle_type"])["estimated_cost_eur"].transform("median")
     cmc = df.groupby("damage_category")["estimated_cost_eur"].transform("median")
     df["estimated_cost_eur"] = df["estimated_cost_eur"].fillna(gmc).fillna(cmc)
